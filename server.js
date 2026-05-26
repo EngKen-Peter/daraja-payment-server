@@ -287,10 +287,26 @@ app.post('/api/test/mqtt', async (req, res) => {
     }
 });
 
+// ==================== KEEP-ALIVE ENDPOINTS ====================
+// Prevents Render free tier from spinning down after 15 minutes of inactivity
+// External service should ping this every 10-12 minutes
+
+app.get('/keep-alive', (req, res) => {
+    res.status(200).send('OK');
+    console.log(`💓 Keep-alive ping received at ${new Date().toISOString()}`);
+});
+
+app.get('/ping', (req, res) => {
+    res.status(200).send('pong');
+});
+
+// ==================== START SERVER ====================
+
 // Start server and generate initial token
 app.listen(port, async () => {
     console.log(`🚀 Server running on port ${port}`);
     console.log(`📍 URL: https://daraja-payment-server-1.onrender.com`);
+    console.log(`💓 Keep-alive endpoints: /keep-alive and /ping`);
     
     // Generate initial access token
     try {
