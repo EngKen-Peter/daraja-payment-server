@@ -65,7 +65,7 @@ function connectMQTT() {
     }
 }
 
-// ADDED: Publish message to MQTT topic
+// ADDED: Publish message to MQTT topic (UPDATED with first_name)
 function publishToMQTT(transaction) {
     if (!mqttClient || !mqttClient.connected) {
         console.error('❌ MQTT not connected - cannot send dispense command');
@@ -77,6 +77,7 @@ function publishToMQTT(transaction) {
             transaction_id: transaction.TransID,
             amount: transaction.TransAmount,
             phone: transaction.MSISDN,
+            first_name: transaction.FirstName || '',  // ADDED: Customer first name
             bill_ref: transaction.BillRefNumber || '',
             transaction_time: transaction.TransTime,
             timestamp: new Date().toISOString(),
@@ -91,6 +92,7 @@ function publishToMQTT(transaction) {
                 console.log(`   Topic: ${mqttConfig.topic}`);
                 console.log(`   Transaction: ${transaction.TransID}`);
                 console.log(`   Amount: ${transaction.TransAmount} KES`);
+                console.log(`   Customer: ${transaction.FirstName || 'Unknown'}`);  // ADDED: Log customer name
             }
         });
         return true;
@@ -177,6 +179,7 @@ app.post('/api/c2b/confirmation', async (req, res) => {
         console.log(`📋 Transaction ID: ${transaction.TransID}`);
         console.log(`💰 Amount: ${transaction.TransAmount} KES`);
         console.log(`📱 Phone: ${transaction.MSISDN}`);
+        console.log(`👤 Customer: ${transaction.FirstName || 'Unknown'}`);  // ADDED: Log customer name
         console.log(`🕐 Time: ${transaction.TransTime}`);
         console.log(`🏦 Bill Ref: ${transaction.BillRefNumber}`);
         console.log(`📝 Transaction Type: ${transaction.TransactionType}`);
@@ -270,11 +273,12 @@ app.get('/api/status', (req, res) => {
 // ADDED: Test MQTT endpoint (for debugging - can be removed later)
 app.post('/api/test/mqtt', async (req, res) => {
     try {
-        const { transaction_id, amount, phone } = req.body;
+        const { transaction_id, amount, phone, first_name } = req.body;
         const testTransaction = {
             TransID: transaction_id || 'TEST_12345',
             TransAmount: amount || '10.00',
             MSISDN: phone || '254712345678',
+            FirstName: first_name || 'Test Customer',  // ADDED: Test customer name
             TransTime: new Date().toISOString(),
             BillRefNumber: '',
             TransactionType: 'Customer Merchant Payment'
