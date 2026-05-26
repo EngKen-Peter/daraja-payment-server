@@ -2,7 +2,8 @@ require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
-const mqtt = require('mqtt');  // ADDED: MQTT package for coffee dispenser
+const mqtt = require('mqtt');
+const { Pool } = require('pg');  // ADDED: PostgreSQL database
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -17,11 +18,165 @@ const config = {
     consumerKey: process.env.MPESA_CONSUMER_KEY,
     consumerSecret: process.env.MPESA_CONSUMER_SECRET,
     passkey: process.env.MPESA_PASSKEY,
-    shortcode: process.env.MPESA_BUSINESS_SHORTCODE || '4561807',  // Updated to child store number
+    shortcode: process.env.MPESA_BUSINESS_SHORTCODE || '4561807',
     environment: process.env.MPESA_ENVIRONMENT || 'production'
 };
 
-// ADDED: HiveMQ MQTT Configuration for Coffee Dispenser
+// ADDED: PostgreSQL Database Configuration
+const dbConfig = {
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }  // Required for Render PostgreSQL
+};
+
+let dbPool = null;
+
+// ADDED: Initialize Database Connection
+function initDatabase() {
+    try {
+        dbPool = new Pool(dbConfig);
+        console.log('✅ Database connected successfully');
+        return true;
+    } catch (error) {
+        console.error('❌ Database connection failed:', error.message);
+        return false;
+    }
+}
+
+// ADDED: Create tables if they don't exist
+async function createTables() {
+    if (!dbPool) return;
+    
+    try {
+        await dbPool.query(`
+            CREATE TABLE IF NOT EXISTS transactions (
+                id SERIAL PRIMARY KEY,
+                transaction_id VARCHAR(50) UNIQUE NOT NULL,
+                amount DECIMAL(10,2) NOT NULL,
+                phone_number VARCHAR(255),
+                customer_name VARCHAR(100),
+                bill_ref_number VARCHAR(100),
+                transaction_time VARCHAR(20),
+                transaction_type VARCHAR(50),
+                business_shortcode VARCHAR(20),
+                raw_data JSONB,
+                processed BOOLEAN DEFAULT false,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        
+        await dbPool.query(`
+            CREATE INDEX IF NOT EXISTS idx_transaction_id ON transactions(transaction_id);
+            CREATE INDEX IF NOT EXISTS idx_created_at ON transactions(created_at);
+            CREATE INDEX IF NOT EXISTS idx_phone_number ON transactions(phone_number);
+        `);
+        
+        console.log('✅ Database tables created/verified');
+    } catch (error) {
+        console.error('❌ Failed to create tables:', error.message);
+    }
+}
+
+// ADDED: Save transaction to database
+async function saveTransaction(transaction) {
+    if (!dbPool) {
+        console.error('❌ Database not connected - cannot save transaction');
+        return false;
+    }
+    
+    try {
+        const query = `
+            INSERT INTO transactions 
+            (transaction_id, amount, phone_number, customer_name, bill_ref_number, 
+             transaction_time, transaction_type, business_shortcode, raw_data)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (transaction_id) DO UPDATE SET
+                amount = EXCLUDED.amount,
+                customer_name = EXCLUDED.customer_name,
+                raw_data = EXCLUDED.raw_data
+            RETURNING id
+        `;
+        
+        const values = [
+            transaction.TransID,
+            parseFloat(transaction.TransAmount),
+            transaction.MSISDN,
+            transaction.FirstName || null,
+            transaction.BillRefNumber || '',
+            transaction.TransTime,
+            transaction.TransactionType || 'Customer Merchant Payment',
+            transaction.BusinessShortCode || config.shortcode,
+            JSON.stringify(transaction)
+        ];
+        
+        const result = await dbPool.query(query, values);
+        console.log(`💾 Transaction ${transaction.TransID} saved to database (ID: ${result.rows[0].id})`);
+        return true;
+    } catch (error) {
+        console.error('❌ Failed to save transaction:', error.message);
+        return false;
+    }
+}
+
+// ADDED: Get transactions from database
+async function getTransactions(limit = 50, offset = 0) {
+    if (!dbPool) return [];
+    
+    try {
+        const query = `
+            SELECT id, transaction_id, amount, phone_number, customer_name, 
+                   bill_ref_number, transaction_time, transaction_type, 
+                   processed, created_at
+            FROM transactions 
+            ORDER BY created_at DESC 
+            LIMIT $1 OFFSET $2
+        `;
+        const result = await dbPool.query(query, [limit, offset]);
+        return result.rows;
+    } catch (error) {
+        console.error('❌ Failed to get transactions:', error.message);
+        return [];
+    }
+}
+
+// ADDED: Get transaction by ID
+async function getTransactionById(transactionId) {
+    if (!dbPool) return null;
+    
+    try {
+        const query = `SELECT * FROM transactions WHERE transaction_id = $1`;
+        const result = await dbPool.query(query, [transactionId]);
+        return result.rows[0] || null;
+    } catch (error) {
+        console.error('❌ Failed to get transaction:', error.message);
+        return null;
+    }
+}
+
+// ADDED: Get daily sales summary
+async function getDailySalesSummary() {
+    if (!dbPool) return [];
+    
+    try {
+        const query = `
+            SELECT 
+                DATE(created_at) as sale_date,
+                COUNT(*) as transaction_count,
+                SUM(amount) as total_amount,
+                COUNT(DISTINCT phone_number) as unique_customers
+            FROM transactions 
+            WHERE created_at >= NOW() - INTERVAL '30 days'
+            GROUP BY DATE(created_at)
+            ORDER BY sale_date DESC
+        `;
+        const result = await dbPool.query(query);
+        return result.rows;
+    } catch (error) {
+        console.error('❌ Failed to get daily summary:', error.message);
+        return [];
+    }
+}
+
+// MQTT Configuration
 const mqttConfig = {
     brokerUrl: process.env.MQTT_BROKER_URL || 'mqtts://ef6a77de243f47bcad53fd8d6c2cad46.s1.eu.hivemq.cloud:8883',
     username: process.env.MQTT_USERNAME || 'coffee_dispenser',
@@ -31,7 +186,7 @@ const mqttConfig = {
 
 let mqttClient = null;
 
-// ADDED: Connect to HiveMQ MQTT Broker
+// Connect to HiveMQ MQTT Broker
 function connectMQTT() {
     try {
         console.log('🔌 Connecting to HiveMQ Cloud MQTT broker...');
@@ -39,7 +194,7 @@ function connectMQTT() {
         mqttClient = mqtt.connect(mqttConfig.brokerUrl, {
             username: mqttConfig.username,
             password: mqttConfig.password,
-            rejectUnauthorized: true,  // Required for secure connection
+            rejectUnauthorized: true,
             keepalive: 60,
             reconnectPeriod: 5000
         });
@@ -65,7 +220,7 @@ function connectMQTT() {
     }
 }
 
-// ADDED: Publish message to MQTT topic (UPDATED with first_name)
+// Publish message to MQTT topic
 function publishToMQTT(transaction) {
     if (!mqttClient || !mqttClient.connected) {
         console.error('❌ MQTT not connected - cannot send dispense command');
@@ -77,7 +232,7 @@ function publishToMQTT(transaction) {
             transaction_id: transaction.TransID,
             amount: transaction.TransAmount,
             phone: transaction.MSISDN,
-            first_name: transaction.FirstName || '',  // ADDED: Customer first name
+            first_name: transaction.FirstName || '',
             bill_ref: transaction.BillRefNumber || '',
             transaction_time: transaction.TransTime,
             timestamp: new Date().toISOString(),
@@ -92,7 +247,7 @@ function publishToMQTT(transaction) {
                 console.log(`   Topic: ${mqttConfig.topic}`);
                 console.log(`   Transaction: ${transaction.TransID}`);
                 console.log(`   Amount: ${transaction.TransAmount} KES`);
-                console.log(`   Customer: ${transaction.FirstName || 'Unknown'}`);  // ADDED: Log customer name
+                console.log(`   Customer: ${transaction.FirstName || 'Unknown'}`);
             }
         });
         return true;
@@ -109,10 +264,20 @@ console.log(`Shortcode: ${config.shortcode}`);
 console.log(`MQTT Topic: ${mqttConfig.topic}`);
 console.log('===========================================');
 
+// Initialize Database
+initDatabase();
+
+// Create tables after database connection
+setTimeout(() => {
+    if (dbPool) {
+        createTables();
+    }
+}, 2000);
+
 // Connect to MQTT broker on startup
 connectMQTT();
 
-// In-memory token storage (in production, use Redis or database)
+// In-memory token storage
 let accessToken = null;
 let tokenExpiry = null;
 
@@ -142,7 +307,7 @@ async function generateAccessToken() {
     }
 }
 
-// Get valid access token (generates new if expired)
+// Get valid access token
 async function getValidToken() {
     if (!accessToken || Date.now() >= tokenExpiry) {
         await generateAccessToken();
@@ -159,13 +324,13 @@ app.get('/', (req, res) => {
         environment: config.environment,
         shortcode: config.shortcode,
         mqtt_connected: mqttClient ? mqttClient.connected : false,
+        database_connected: dbPool ? true : false,
         message: 'M-Pesa Daraja Server is running successfully',
         timestamp: new Date().toISOString()
     });
 });
 
 // Confirmation URL endpoint (Called by Safaricom after successful payment)
-// IMPORTANT: URL does NOT contain "mpesa" - Safaricom blocks URLs with that word
 app.post('/api/c2b/confirmation', async (req, res) => {
     try {
         console.log('=========================================');
@@ -175,25 +340,21 @@ app.post('/api/c2b/confirmation', async (req, res) => {
         
         const transaction = req.body;
         
-        // Log important transaction details
         console.log(`📋 Transaction ID: ${transaction.TransID}`);
         console.log(`💰 Amount: ${transaction.TransAmount} KES`);
         console.log(`📱 Phone: ${transaction.MSISDN}`);
-        console.log(`👤 Customer: ${transaction.FirstName || 'Unknown'}`);  // ADDED: Log customer name
+        console.log(`👤 Customer: ${transaction.FirstName || 'Unknown'}`);
         console.log(`🕐 Time: ${transaction.TransTime}`);
-        console.log(`🏦 Bill Ref: ${transaction.BillRefNumber}`);
-        console.log(`📝 Transaction Type: ${transaction.TransactionType}`);
         
-        // ADDED: Send MQTT message to Raspberry Pi to dispense coffee
+        // Save to database
+        await saveTransaction(transaction);
+        
+        // Send MQTT message to Raspberry Pi
         console.log('📡 Sending dispense command via MQTT...');
         publishToMQTT(transaction);
         
-        // TODO: Save transaction to database
-        // TODO: Update order/invoice status
-        
         console.log('=========================================');
         
-        // Respond to Safaricom
         res.status(200).json({
             ResultCode: 0,
             ResultDesc: 'Success'
@@ -207,7 +368,7 @@ app.post('/api/c2b/confirmation', async (req, res) => {
     }
 });
 
-// Validation URL endpoint (Called by Safaricom before payment)
+// Validation URL endpoint
 app.post('/api/c2b/validation', async (req, res) => {
     try {
         console.log('=========================================');
@@ -215,16 +376,6 @@ app.post('/api/c2b/validation', async (req, res) => {
         console.log('=========================================');
         console.log('Validation Data:', JSON.stringify(req.body, null, 2));
         
-        const validation = req.body;
-        
-        console.log(`📱 Validating payment from ${validation.MSISDN}`);
-        console.log(`💰 Amount: ${validation.TransAmount}`);
-        console.log(`🏦 Bill Ref: ${validation.BillRefNumber}`);
-        
-        console.log('=========================================');
-        
-        // Always return success to accept transaction
-        // To reject: ResultCode: 1, ResultDesc: 'Rejected'
         res.status(200).json({
             ResultCode: 0,
             ResultDesc: 'Success'
@@ -238,7 +389,7 @@ app.post('/api/c2b/validation', async (req, res) => {
     }
 });
 
-// Generate token endpoint (for testing)
+// Generate token endpoint
 app.get('/api/token', async (req, res) => {
     try {
         const token = await getValidToken();
@@ -265,12 +416,70 @@ app.get('/api/status', (req, res) => {
         token_valid: accessToken && Date.now() < tokenExpiry,
         token_expires_at: tokenExpiry ? new Date(tokenExpiry).toISOString() : null,
         mqtt_connected: mqttClient ? mqttClient.connected : false,
+        database_connected: dbPool ? true : false,
         uptime: process.uptime(),
         timestamp: new Date().toISOString()
     });
 });
 
-// ADDED: Test MQTT endpoint (for debugging - can be removed later)
+// ==================== DATABASE API ENDPOINTS ====================
+
+// Get recent transactions
+app.get('/api/transactions', async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit) || 50;
+        const offset = parseInt(req.query.offset) || 0;
+        const transactions = await getTransactions(limit, offset);
+        res.json({
+            success: true,
+            count: transactions.length,
+            transactions: transactions
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Get transaction by ID
+app.get('/api/transactions/:id', async (req, res) => {
+    try {
+        const transaction = await getTransactionById(req.params.id);
+        if (transaction) {
+            res.json({ success: true, transaction });
+        } else {
+            res.status(404).json({ success: false, error: 'Transaction not found' });
+        }
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Get daily sales summary
+app.get('/api/sales/summary', async (req, res) => {
+    try {
+        const summary = await getDailySalesSummary();
+        
+        let totalResult = { rows: [{ total_transactions: 0, total_revenue: 0 }] };
+        if (dbPool) {
+            totalResult = await dbPool.query(`
+                SELECT 
+                    COUNT(*) as total_transactions,
+                    SUM(amount) as total_revenue
+                FROM transactions
+            `);
+        }
+        
+        res.json({
+            success: true,
+            daily_summary: summary,
+            totals: totalResult.rows[0] || { total_transactions: 0, total_revenue: 0 }
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Test MQTT endpoint
 app.post('/api/test/mqtt', async (req, res) => {
     try {
         const { transaction_id, amount, phone, first_name } = req.body;
@@ -278,7 +487,7 @@ app.post('/api/test/mqtt', async (req, res) => {
             TransID: transaction_id || 'TEST_12345',
             TransAmount: amount || '10.00',
             MSISDN: phone || '254712345678',
-            FirstName: first_name || 'Test Customer',  // ADDED: Test customer name
+            FirstName: first_name || 'Test Customer',
             TransTime: new Date().toISOString(),
             BillRefNumber: '',
             TransactionType: 'Customer Merchant Payment'
@@ -292,8 +501,6 @@ app.post('/api/test/mqtt', async (req, res) => {
 });
 
 // ==================== KEEP-ALIVE ENDPOINTS ====================
-// Prevents Render free tier from spinning down after 15 minutes of inactivity
-// External service should ping this every 10-12 minutes
 
 app.get('/keep-alive', (req, res) => {
     res.status(200).send('OK');
@@ -306,13 +513,12 @@ app.get('/ping', (req, res) => {
 
 // ==================== START SERVER ====================
 
-// Start server and generate initial token
 app.listen(port, async () => {
     console.log(`🚀 Server running on port ${port}`);
     console.log(`📍 URL: https://daraja-payment-server-1.onrender.com`);
     console.log(`💓 Keep-alive endpoints: /keep-alive and /ping`);
+    console.log(`📊 Database endpoints: /api/transactions, /api/sales/summary`);
     
-    // Generate initial access token
     try {
         await generateAccessToken();
         console.log('🎉 Server ready to process M-Pesa payments!');
