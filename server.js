@@ -181,10 +181,21 @@ const mqttConfig = {
     brokerUrl: process.env.MQTT_BROKER_URL || 'mqtts://ef6a77de243f47bcad53fd8d6c2cad46.s1.eu.hivemq.cloud:8883',
     username: process.env.MQTT_USERNAME || 'coffee_dispenser',
     password: process.env.MQTT_PASSWORD || 'Smartcoffeedispenser@Saf001',
-    topic: process.env.MQTT_TOPIC || 'coffee/dispense'
+    topic: process.env.MQTT_TOPIC || 'coffee/dispense',
+    statusTopic: process.env.MQTT_STATUS_TOPIC || 'coffee/machine/status'  // ADDED: Machine status topic
 };
 
 let mqttClient = null;
+
+// ADDED: Store current machine state (updated by Raspberry Pi via MQTT)
+let machineState = {
+    status: 'unknown',
+    message: 'Waiting for machine status...',
+    lastUpdate: null,
+    temperature: null,
+    water_level: null,
+    bean_level: null
+};
 
 // Connect to HiveMQ MQTT Broker
 function connectMQTT() {
@@ -201,7 +212,16 @@ function connectMQTT() {
 
         mqttClient.on('connect', () => {
             console.log('✅ Connected to HiveMQ Cloud MQTT broker');
-            console.log(`   Topic: ${mqttConfig.topic}`);
+            console.log(`   Dispense topic: ${mqttConfig.topic}`);
+            
+            // ADDED: Subscribe to machine status topic
+            mqttClient.subscribe(mqttConfig.statusTopic, { qos: 1 }, (err) => {
+                if (err) {
+                    console.error('❌ Failed to subscribe to machine status:', err.message);
+                } else {
+                    console.log(`✅ Subscribed to ${mqttConfig.statusTopic}`);
+                }
+            });
         });
 
         mqttClient.on('error', (error) => {
@@ -214,6 +234,32 @@ function connectMQTT() {
 
         mqttClient.on('offline', () => {
             console.log('⚠️ MQTT client is offline');
+        });
+
+        // ADDED: Handle incoming machine status messages from Raspberry Pi
+        mqttClient.on('message', (topic, message) => {
+            if (topic === mqttConfig.statusTopic) {
+                try {
+                    const status = JSON.parse(message.toString());
+                    machineState = {
+                        status: status.status || 'unknown',
+                        message: status.message || '',
+                        lastUpdate: new Date().toISOString(),
+                        temperature: status.temperature || null,
+                        water_level: status.water_level || null,
+                        bean_level: status.bean_level || null
+                    };
+                    console.log('=========================================');
+                    console.log(`📊 MACHINE STATUS UPDATED: ${machineState.status}`);
+                    console.log(`   Message: ${machineState.message}`);
+                    if (machineState.temperature) console.log(`   Temperature: ${machineState.temperature}°C`);
+                    if (machineState.water_level) console.log(`   Water: ${machineState.water_level}%`);
+                    if (machineState.bean_level) console.log(`   Beans: ${machineState.bean_level}%`);
+                    console.log('=========================================');
+                } catch (error) {
+                    console.error('❌ Failed to parse machine status:', error.message);
+                }
+            }
         });
     } catch (error) {
         console.error('❌ Failed to connect to MQTT:', error.message);
@@ -261,7 +307,8 @@ console.log('=== M-Pesa Daraja Server Configuration ===');
 console.log(`Environment: ${config.environment}`);
 console.log(`Base URL: ${config.baseUrl}`);
 console.log(`Shortcode: ${config.shortcode}`);
-console.log(`MQTT Topic: ${mqttConfig.topic}`);
+console.log(`MQTT Dispense Topic: ${mqttConfig.topic}`);
+console.log(`MQTT Status Topic: ${mqttConfig.statusTopic}`);
 console.log('===========================================');
 
 // Initialize Database
@@ -325,6 +372,7 @@ app.get('/', (req, res) => {
         shortcode: config.shortcode,
         mqtt_connected: mqttClient ? mqttClient.connected : false,
         database_connected: dbPool ? true : false,
+        machine_state: machineState.status,  // ADDED: Machine state
         message: 'M-Pesa Daraja Server is running successfully',
         timestamp: new Date().toISOString()
     });
@@ -368,13 +416,34 @@ app.post('/api/c2b/confirmation', async (req, res) => {
     }
 });
 
-// Validation URL endpoint
+// Validation URL endpoint - UPDATED to check machine state
 app.post('/api/c2b/validation', async (req, res) => {
     try {
         console.log('=========================================');
         console.log('🔍 PAYMENT VALIDATION RECEIVED');
         console.log('=========================================');
         console.log('Validation Data:', JSON.stringify(req.body, null, 2));
+        
+        const validation = req.body;
+        
+        console.log(`📱 Validating payment from ${validation.MSISDN}`);
+        console.log(`💰 Amount: ${validation.TransAmount}`);
+        console.log(`📊 Current machine state: ${machineState.status}`);
+        
+        // ADDED: Reject payment if machine is NOT ready
+        if (machineState.status !== 'ready') {
+            console.log(`❌ REJECTING PAYMENT - Machine is "${machineState.status}"`);
+            console.log(`   Reason: ${machineState.message}`);
+            console.log('=========================================');
+            
+            return res.status(200).json({
+                ResultCode: 1,
+                ResultDesc: `Machine not ready: ${machineState.message || machineState.status}`
+            });
+        }
+        
+        console.log('✅ Machine is READY - accepting payment');
+        console.log('=========================================');
         
         res.status(200).json({
             ResultCode: 0,
@@ -417,8 +486,17 @@ app.get('/api/status', (req, res) => {
         token_expires_at: tokenExpiry ? new Date(tokenExpiry).toISOString() : null,
         mqtt_connected: mqttClient ? mqttClient.connected : false,
         database_connected: dbPool ? true : false,
+        machine_state: machineState.status,  // ADDED: Machine state
         uptime: process.uptime(),
         timestamp: new Date().toISOString()
+    });
+});
+
+// ADDED: Machine status endpoint - check current machine state
+app.get('/api/machine/status', (req, res) => {
+    res.json({
+        success: true,
+        machine: machineState
     });
 });
 
@@ -500,6 +578,32 @@ app.post('/api/test/mqtt', async (req, res) => {
     }
 });
 
+// ADDED: Test endpoint to simulate machine status (for testing without the Pi)
+app.post('/api/test/machine-status', async (req, res) => {
+    try {
+        const { status, message, temperature } = req.body;
+        
+        machineState = {
+            status: status || 'ready',
+            message: message || 'Machine is ready to dispense',
+            lastUpdate: new Date().toISOString(),
+            temperature: temperature || null,
+            water_level: null,
+            bean_level: null
+        };
+        
+        console.log(`📊 Machine status updated via test endpoint: ${machineState.status}`);
+        
+        res.json({
+            success: true,
+            message: 'Machine status updated',
+            machine: machineState
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 // ==================== KEEP-ALIVE ENDPOINTS ====================
 
 app.get('/keep-alive', (req, res) => {
@@ -518,6 +622,7 @@ app.listen(port, async () => {
     console.log(`📍 URL: https://daraja-payment-server-1.onrender.com`);
     console.log(`💓 Keep-alive endpoints: /keep-alive and /ping`);
     console.log(`📊 Database endpoints: /api/transactions, /api/sales/summary`);
+    console.log(`📟 Machine status: /api/machine/status`);
     
     try {
         await generateAccessToken();
